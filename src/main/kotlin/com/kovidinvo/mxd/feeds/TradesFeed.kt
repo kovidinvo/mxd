@@ -8,26 +8,39 @@ import org.elasticsearch.action.bulk.BulkRequest
 import org.elasticsearch.action.index.IndexRequest
 import org.elasticsearch.client.RequestOptions
 import org.elasticsearch.client.RestHighLevelClient
+import org.elasticsearch.client.indices.CreateIndexRequest
+import org.elasticsearch.client.indices.GetIndexRequest
+import org.elasticsearch.client.indices.PutMappingRequest
+import org.elasticsearch.common.xcontent.XContentBuilder
+import org.elasticsearch.common.xcontent.XContentFactory
+import org.elasticsearch.common.xcontent.XContentType
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.web.reactive.function.client.ExchangeStrategies
+import org.springframework.web.reactive.function.client.awaitBody
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
+import javax.annotation.PostConstruct
 import org.springframework.web.reactive.function.client.WebClient.builder as WebCltBuilder
 
 data class MxdResponse(
     val metadata : Map<String,String>,
     val columns: List<String>,
-    val data: List<List<Any>>
+    val data: List<Map<String,Any>>
 )
 
 @Component
 class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
 
-    private val mxClt = WebCltBuilder().baseUrl("https://iss.moex.com/iss/engines/stock/markets/shares/")
+    private val logger = LoggerFactory.getLogger(TradesFeed::class.java)
+    private val SECID = "SECID"
+    private val TRADEID = "TRADENO"
+
+    private val mxClt = WebCltBuilder().baseUrl("https://iss.moex.com/iss/")
         .defaultHeader("Content-Type","application/json")
         .exchangeStrategies(ExchangeStrategies.builder()
             .codecs{ cod -> cod.defaultCodecs().maxInMemorySize(16*1024*1024)}.build())
@@ -37,12 +50,63 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
 
     private var start : Int = 0
 
-    @Scheduled(fixedDelay = 60*1000)
+    @Scheduled(cron="0 0 3 * * MON-FRI")
+    fun dailyAtNight() {
+        start=0
+    }
+
+    @PostConstruct
+    fun initializeIndexes() {
+        val bodyNode = mxClt.get().uri("engines/stock/markets/shares/securities.json")
+            .retrieve().bodyToMono(String::class.java).map { b -> mapper.readTree(b) }.block() ?: throw ExceptionInInitializerError("securities loading error")
+        val dataNode = bodyNode.path("securities").path("data")
+        val data = mapper.convertValue(dataNode,object: TypeReference<List<List<String>>>(){})
+        val securites = data.map { rec -> rec[0].lowercase() }.toSet().toList()
+        //create indexes
+        securites.forEach { sec ->
+            val indname ="trades-shares-${sec}"
+            val mappingStr = """
+            {
+            "properties" : {
+                "TRADENO" : { "type" : "long" },
+                "TRADETIME" : { "type" : "long" } ,
+                "BOARDID"  : { "type" : "keyword" },
+                "SECID"  : { "type" : "keyword"},
+                "PRICE"  : { "type" : "double" },
+                "QUANTITY"  : { "type" : "long" },
+                "VALUE"  : { "type" : "double" },
+                "PERIOD"  : { "type" : "text" },
+                "TRADETIME_GRP" : { "type" : "long" },
+                "SYSTIME"  : { "type" : "text" },
+                "BUYSELL"  : { "type" : "keyword" },
+                "DECIMALS"  : { "type" : "integer" },
+                "TRADINGSESSION"  : { "type" : "text" }
+                }
+            }
+        """.trimIndent()
+
+            if(elClt.indices().exists(GetIndexRequest(indname), RequestOptions.DEFAULT)) {
+              //update mapping and return
+                val req = PutMappingRequest(indname)
+                req.source(mappingStr,XContentType.JSON)
+                elClt.indices().putMapping(req, RequestOptions.DEFAULT)
+                logger.info("Updated mappings: $indname")
+                return@forEach
+            }
+            val req = CreateIndexRequest(indname)
+            req.mapping(mappingStr,XContentType.JSON)
+            val resp =elClt.indices().create(req, RequestOptions.DEFAULT)
+            logger.info("Created index: $indname = ${resp.isAcknowledged}")
+        }
+    }
+
+    @Scheduled(cron="0 */2 9-23 * * MON-FRI")
     fun fetchTrades() {
-        mxClt.get().uri("trades.json?start=${start}")
+        mxClt.get().uri("engines/stock/markets/shares/trades.json?start=${start}")
             .retrieve().bodyToMono(String::class.java)
             .map(::processData)
             .doOnNext { mxd ->
+                logger.info("Fetched ${mxd.data.size} records")
                 start+=mxd.data.size
                 if(mxd.data.size>0) fetchTrades()
             }.subscribe(::processTrades)
@@ -61,7 +125,7 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
             }.toMap()
         val pdata = data.map { rec ->
             rec.toList().mapIndexed { ind, el ->
-                when (metaMap[colList[ind]]) {
+                val value = when (metaMap[colList[ind]]) {
                     "string" -> el.asText()
                     "int64" -> el.asLong()
                     "int32" -> el.asInt()
@@ -73,21 +137,25 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
                     "datetime" -> el.asText()
                     else -> el.asText()
                 }
-            }
+                Pair(colList[ind],value)
+            }.toMap()
         }
         return MxdResponse(metaMap,colList,pdata)
     }
 
     fun processTrades(resp : MxdResponse) {
+        if(resp.data.size==0) return
         val breq = BulkRequest()
-        val secInd = resp.columns.indexOf("SECID")
-        val dataSorted = resp.data.sortedBy { it[secInd].toString() }
+        val dataSorted = resp.data.sortedBy { it[SECID].toString() }
         dataSorted.forEach { tr ->
-            val indReq = IndexRequest("trades-shares-${tr[secInd]}").id(tr[0].toString())
-            val source = indReq.sourceAsMap()
-            tr.forEachIndexed{ index,fld  -> source[resp.metadata[resp.columns[index]]]=fld }
+            val secName = tr[SECID].toString().lowercase()
+            val indexName = "trades-shares-${secName}"
+            val indReq = IndexRequest(indexName).id(tr[TRADEID].toString())
+            indReq.source(tr)
             breq.add(indReq)
         }
-        elClt.bulk(breq, RequestOptions.DEFAULT)
+        val resp= elClt.bulk(breq, RequestOptions.DEFAULT)
+        if(resp.hasFailures())
+            logger.warn("Bulk response: "+resp.buildFailureMessage())
     }
 }

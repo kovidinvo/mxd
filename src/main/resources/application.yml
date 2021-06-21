@@ -1,0 +1,6 @@
+mxd:
+  elastic:
+    host: ${ES_HOST:localhost}
+    port: ${ES_PORT:9020}
+    username: ${ES_USER:admin}
+    password: ${ES_PASS:admin}
