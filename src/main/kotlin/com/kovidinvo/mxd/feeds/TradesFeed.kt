@@ -1,7 +1,6 @@
 package com.kovidinvo.mxd.feeds
 
 import com.fasterxml.jackson.core.type.TypeReference
-import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import org.elasticsearch.action.bulk.BulkRequest
@@ -11,16 +10,12 @@ import org.elasticsearch.client.RestHighLevelClient
 import org.elasticsearch.client.indices.CreateIndexRequest
 import org.elasticsearch.client.indices.GetIndexRequest
 import org.elasticsearch.client.indices.PutMappingRequest
-import org.elasticsearch.common.xcontent.XContentBuilder
-import org.elasticsearch.common.xcontent.XContentFactory
 import org.elasticsearch.common.xcontent.XContentType
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.web.reactive.function.client.ExchangeStrategies
-import org.springframework.web.reactive.function.client.awaitBody
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
@@ -64,12 +59,12 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
         val securites = data.map { rec -> rec[0].lowercase() }.toSet().toList()
         //create indexes
         securites.forEach { sec ->
-            val indname ="trades-shares-${sec}"
+            val indname ="shares-trades-${sec}"
             val mappingStr = """
             {
             "properties" : {
                 "TRADENO" : { "type" : "long" },
-                "TRADETIME" : { "type" : "long" } ,
+                "TRADETIME" : { "type" : "date", "format":"strict_date_optional_time||epoch_second" } ,
                 "BOARDID"  : { "type" : "keyword" },
                 "SECID"  : { "type" : "keyword"},
                 "PRICE"  : { "type" : "double" },
@@ -145,11 +140,11 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
 
     fun processTrades(resp : MxdResponse) {
         if(resp.data.size==0) return
+        val data2Index = filterTradesData(resp)
         val breq = BulkRequest()
-        val dataSorted = resp.data.sortedBy { it[SECID].toString() }
-        dataSorted.forEach { tr ->
+        data2Index.forEach { tr ->
             val secName = tr[SECID].toString().lowercase()
-            val indexName = "trades-shares-${secName}"
+            val indexName = "shares-trades-${secName}"
             val indReq = IndexRequest(indexName).id(tr[TRADEID].toString())
             indReq.source(tr)
             breq.add(indReq)
@@ -157,5 +152,34 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
         val resp= elClt.bulk(breq, RequestOptions.DEFAULT)
         if(resp.hasFailures())
             logger.warn("Bulk response: "+resp.buildFailureMessage())
+        else logger.info("Stored ${data2Index.size} records")
+    }
+
+   private inline fun <T> get2Slices(src: List<T>, sliceSize: Int) : List<T> {
+       if(sliceSize>src.size) return src
+       val bottom = src.size - sliceSize
+       if(bottom<sliceSize) return src
+       val retList = src.take(sliceSize).toMutableList()
+       retList.addAll(src.takeLast(sliceSize))
+       return retList
+   }
+
+    fun filterTradesData(resp: MxdResponse) : List<Map<String,Any>> {
+        val dataBySec = mutableMapOf<String,MutableList<Map<String,Any>>>()
+        resp.data.forEach { rec ->
+            if(dataBySec[rec["SECID"].toString()] == null)
+                dataBySec[rec["SECID"].toString()]=mutableListOf(rec)
+            else dataBySec[rec["SECID"].toString()]!!.add(rec)
+        }
+        val dataPriceSorted= dataBySec.mapValues { pair -> pair.value.sortedBy { (it["PRICE"] as Double) } }
+        val dataVolumeSorted= dataBySec.mapValues { pair -> pair.value.sortedBy { (it["QUANTITY"] as Int) } }
+        val trades = emptySet<String>().toMutableSet()
+        val dataFiltered = dataPriceSorted
+            .mapValues { val res=get2Slices(it.value,1); res.forEach { e -> trades.add(e["TRADENO"].toString()) } ; res }
+        val dataFiltered2 = dataVolumeSorted
+            .mapValues { it.value.filter { e -> !trades.contains(e["TRADENO"].toString())}.takeLast(1) }
+        val dataRet = dataFiltered.flatMap { it.value }.toMutableList()
+        dataRet.addAll(dataFiltered2.flatMap { it.value })
+        return dataRet
     }
 }
