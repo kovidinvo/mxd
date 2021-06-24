@@ -47,6 +47,7 @@ class TradesFeed(@Autowired val elClt: RestHighLevelClient) {
 
     @Scheduled(cron="0 0 3 * * MON-FRI")
     fun dailyAtNight() {
+        logger.info("Start count reset to 0")
         start=0
     }
 
